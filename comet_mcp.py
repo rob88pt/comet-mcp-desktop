@@ -17,10 +17,9 @@ import base64
 import json
 import os
 import subprocess
-import time
 import urllib.request
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import sys
 
@@ -38,6 +37,29 @@ CDP_URL = os.environ.get("COMET_CDP_URL", "http://localhost:9222")
 DEFAULT_TIMEOUT = int(os.environ.get("COMET_TIMEOUT", "30000"))  # ms
 MAX_CONTENT_LENGTH = int(os.environ.get("COMET_MAX_CONTENT", "50000"))  # chars
 MAX_WAIT_SECONDS = 120  # hard cap for any sleep/wait parameter
+
+
+# ── Tab classification helpers ──────────────────────────────────────────
+
+_INTERNAL_URL_PREFIXES = ("chrome://", "chrome-extension://", "devtools://")
+
+def _classify_tab_purpose(url: str) -> str:
+    """Classify a tab's purpose based on its URL."""
+    if not url or url == "about:blank":
+        return "INTERNAL"
+    if any(url.startswith(prefix) for prefix in _INTERNAL_URL_PREFIXES):
+        return "INTERNAL"
+    if "perplexity.ai" in url:
+        return "MAIN"
+    return "BROWSING"
+
+def _match_domain(page_url: str, domain_query: str) -> bool:
+    """Check if a page URL matches a domain query (case-insensitive, substring match)."""
+    try:
+        hostname = urlparse(page_url).hostname or ""
+        return domain_query.lower() in hostname.lower()
+    except Exception:
+        return False
 
 
 def _clamp_wait(value: int, default: int = 10) -> int:
@@ -75,7 +97,7 @@ def _find_comet_path() -> Optional[str]:
     return None
 
 
-def _launch_comet(port: int = 9222) -> bool:
+async def _launch_comet(port: int = 9222) -> bool:
     """Launch Comet with remote debugging enabled."""
     path = _find_comet_path()
     if not path:
@@ -93,7 +115,7 @@ def _launch_comet(port: int = 9222) -> bool:
                 urllib.request.urlopen(f"http://localhost:{port}/json", timeout=1)
                 return True
             except Exception:
-                time.sleep(0.5)
+                await asyncio.sleep(0.5)
     except Exception:
         pass
     return False
@@ -124,7 +146,7 @@ async def _ensure_browser() -> Browser:
         pass
 
     # Try auto-launching Comet
-    launched = _launch_comet()
+    launched = await _launch_comet()
     if launched:
         try:
             _browser = await _playwright.chromium.connect_over_cdp(CDP_URL)
@@ -477,44 +499,75 @@ async def comet_tabs(
     action: str = "list",
     tab_index: Optional[int] = None,
     url: Optional[str] = None,
+    domain: Optional[str] = None,
 ) -> str:
     """Manage tabs in the Comet browser.
 
     Args:
-        action: Tab action -- 'list', 'new', 'switch', 'close'.
+        action: Tab action -- 'list', 'new', 'switch', 'close', 'clean'.
         tab_index: Tab index for 'switch' or 'close' (0-based).
         url: URL for 'new' tab action.
+        domain: Domain substring for 'switch' or 'close' (e.g. 'github', 'stackoverflow').
     """
-    VALID_ACTIONS = ("list", "new", "switch", "close")
     global _page
+    VALID_ACTIONS = ("list", "new", "switch", "close", "clean")
+    if action not in VALID_ACTIONS:
+        return f"Error: action must be one of {VALID_ACTIONS}, got '{action}'"
     try:
-        if action not in VALID_ACTIONS:
-            return f"Error: action must be one of {VALID_ACTIONS}, got '{action}'"
         browser = await _ensure_browser()
         contexts = browser.contexts
         if not contexts:
-            return "Error: No browser contexts found."
+            return "Error: No browser contexts. Use comet_connect first."
         pages = contexts[0].pages
+        if not pages:
+            return "Error: No pages open."
 
         if action == "list":
             lines = []
+            hidden_count = 0
             for i, p in enumerate(pages):
-                active = " <- active" if p == _page else ""
+                purpose = _classify_tab_purpose(p.url)
+                if purpose == "INTERNAL":
+                    hidden_count += 1
+                    continue
+                active_marker = " [ACTIVE]" if p == _page else ""
                 try:
                     title = await p.title()
                 except Exception:
                     title = "(untitled)"
-                lines.append(f"  [{i}] {title} - {p.url}{active}")
-            return f"**Open tabs** ({len(pages)}):\n" + "\n".join(lines)
+                lines.append(f"  [{i}] [{purpose}] {title} - {p.url}{active_marker}")
+            result = f"**Open tabs** ({len(lines)} visible"
+            if hidden_count:
+                result += f", {hidden_count} internal hidden"
+            result += "):\n"
+            result += "\n".join(lines) if lines else "  (no visible tabs)"
+            return result
 
         elif action == "new":
             new_page = await contexts[0].new_page()
             if url:
-                await new_page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
+                await new_page.goto(url, wait_until="domcontentloaded")
             _page = new_page
-            return f"**Opened new tab**: {url or 'about:blank'}"
+            return f"**New tab opened**: {url or 'about:blank'}"
 
         elif action == "switch":
+            if domain is not None:
+                matches = [(i, p) for i, p in enumerate(pages) if _match_domain(p.url, domain)]
+                if not matches:
+                    return f"Error: No tab found matching domain '{domain}'."
+                if len(matches) > 1:
+                    descs = []
+                    for idx, pg in matches:
+                        try:
+                            t = await pg.title()
+                        except Exception:
+                            t = "(untitled)"
+                        descs.append(f"  [{idx}] {t} - {pg.url}")
+                    return (
+                        f"Error: Multiple tabs match domain '{domain}'. "
+                        f"Specify tab_index:\n" + "\n".join(descs)
+                    )
+                tab_index = matches[0][0]
             if tab_index is None or tab_index < 0 or tab_index >= len(pages):
                 return f"Error: Invalid tab index. Available: 0-{len(pages)-1}"
             try:
@@ -525,6 +578,23 @@ async def comet_tabs(
                 return f"Error: Tab {tab_index} is no longer available: {tab_err}"
 
         elif action == "close":
+            if domain is not None:
+                matches = [(i, p) for i, p in enumerate(pages) if _match_domain(p.url, domain)]
+                if not matches:
+                    return f"Error: No tab found matching domain '{domain}'."
+                if len(matches) > 1:
+                    descs = []
+                    for idx, pg in matches:
+                        try:
+                            t = await pg.title()
+                        except Exception:
+                            t = "(untitled)"
+                        descs.append(f"  [{idx}] {t} - {pg.url}")
+                    return (
+                        f"Error: Multiple tabs match domain '{domain}'. "
+                        f"Specify tab_index:\n" + "\n".join(descs)
+                    )
+                tab_index = matches[0][0]
             if tab_index is None or tab_index < 0 or tab_index >= len(pages):
                 return f"Error: Invalid tab index. Available: 0-{len(pages)-1}"
             if len(pages) <= 1:
@@ -540,12 +610,38 @@ async def comet_tabs(
             except (IndexError, Exception) as tab_err:
                 return f"Error: Tab {tab_index} is no longer available: {tab_err}"
 
-        return f"Error: Unknown action '{action}'. Use: list, new, switch, close"
+        elif action == "clean":
+            closed_tabs = []
+            protected = []
+            for i in range(len(pages) - 1, -1, -1):
+                p = pages[i]
+                purpose = _classify_tab_purpose(p.url)
+                if purpose != "BROWSING":
+                    protected.append(f"  [{i}] [{purpose}] {p.url}")
+                    continue
+                if p == _page:
+                    protected.append(f"  [{i}] [ACTIVE] {p.url}")
+                    continue
+                if len(pages) - len(closed_tabs) <= 1:
+                    protected.append(f"  [{i}] [LAST] {p.url}")
+                    break
+                try:
+                    title = await p.title()
+                    await p.close()
+                    closed_tabs.append(f"  [{i}] {title} - {p.url}")
+                except Exception:
+                    pass
+            result = f"**Cleaned {len(closed_tabs)} browsing tab(s)**\n"
+            if closed_tabs:
+                result += "Closed:\n" + "\n".join(closed_tabs) + "\n"
+            if protected:
+                result += "Protected:\n" + "\n".join(protected)
+            return result
+
     except Exception as e:
-        error_type = type(e).__name__
         if "closed" in str(e).lower():
             return "Error: Browser connection lost. Use comet_connect to reconnect."
-        return f"Error ({error_type}): {e}"
+        return f"Error ({type(e).__name__}): {e}"
 
 
 @mcp.tool()
@@ -559,8 +655,9 @@ async def comet_evaluate(expression: str) -> str:
         page = await _get_page()
         result = await page.evaluate(expression)
         if isinstance(result, (dict, list)):
-            return json.dumps(result, indent=2, ensure_ascii=False)
-        result_str = str(result)
+            result_str = json.dumps(result, indent=2, ensure_ascii=False)
+        else:
+            result_str = str(result)
         scan = _filter.sanitize(result_str, page.url)
         if scan.injection_detected:
             print(f"⚠️ INJECTION in eval on {page.url}: {len(scan.threats)} patterns", file=sys.stderr)
